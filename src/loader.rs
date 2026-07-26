@@ -7,6 +7,12 @@ pub(crate) struct WorkerModel {
     pub(crate) mtmd_ctx: Option<llama_cpp_2::mtmd::MtmdContext>,
     pub(crate) n_ctx: u32,
     pub(crate) kv_cache: KvCacheParams,
+    /// llguidance's token environment, built on first structured-output
+    /// request and reused for the lifetime of `model` — see
+    /// [`crate::sampling::ModelEnv`] for why it is cached here and not
+    /// rebuilt per request. Tied to this struct so a reload discards it
+    /// alongside the vocabulary it was derived from.
+    pub(crate) tok_env: std::cell::OnceCell<llguidance::toktrie::TokEnv>,
 }
 
 /// Load a model with automatic parameter fitting to available device memory.
@@ -117,5 +123,6 @@ pub(crate) fn fit_and_load_model(
         mtmd_ctx,
         n_ctx: actual_n_ctx,
         kv_cache: *kv_cache,
+        tok_env: std::cell::OnceCell::new(),
     })
 }

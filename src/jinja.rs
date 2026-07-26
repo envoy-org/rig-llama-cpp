@@ -49,7 +49,10 @@ fn unknown_method(
         // `text.split('<channel|>')`, and the no-argument whitespace form.
         "split" => {
             let text = value.as_str().ok_or_else(|| {
-                Error::new(ErrorKind::InvalidOperation, "split() called on a non-string")
+                Error::new(
+                    ErrorKind::InvalidOperation,
+                    "split() called on a non-string",
+                )
             })?;
             let parts: Vec<JValue> = match args.first().and_then(|a| a.as_str()) {
                 Some(sep) => text.split(sep).map(JValue::from).collect(),

@@ -143,7 +143,7 @@ pub(crate) fn run_image_inference<'m>(
                         .eval_chunks(mtmd, &p.ctx, 0, 0, n_batch, true)
                         .map_err(|e| format!("Multimodal eval_chunks failed: {e}"))?;
                     return finish_image_sample(
-                        ctx.model,
+                        &ctx.model_env(),
                         p,
                         new_entries,
                         prompt_tokens,
@@ -179,7 +179,7 @@ pub(crate) fn run_image_inference<'m>(
                         .eval_chunks(mtmd, &p.ctx, 0, 0, n_batch, true)
                         .map_err(|e| format!("Multimodal eval_chunks failed: {e}"))?;
                     return finish_image_sample(
-                        ctx.model,
+                        &ctx.model_env(),
                         p,
                         new_entries,
                         prompt_tokens,
@@ -250,7 +250,7 @@ pub(crate) fn run_image_inference<'m>(
     };
 
     finish_image_sample(
-        ctx.model,
+        &ctx.model_env(),
         p,
         new_entries,
         prompt_tokens,
@@ -268,7 +268,7 @@ pub(crate) fn run_image_inference<'m>(
 /// generated tokens.
 #[allow(clippy::too_many_arguments)]
 fn finish_image_sample(
-    model: &llama_cpp_2::model::LlamaModel,
+    env: &crate::sampling::ModelEnv<'_>,
     p: &mut PersistentCtx<'_>,
     new_entries: Vec<SlotEntry>,
     prompt_tokens: u64,
@@ -286,7 +286,7 @@ fn finish_image_sample(
     let mut batch = LlamaBatch::new(prompt_batch_limit, 1);
 
     let result = sample_tokens_from_pos(
-        model,
+        env,
         &mut p.ctx,
         &mut batch,
         prompt_build,

@@ -292,9 +292,7 @@ fn parse_gemma_value(s: &str, at: &mut usize) -> Option<Value> {
     }
 
     // Bare scalar: runs until the next structural character.
-    let end = rest
-        .find([',', '}', ']'])
-        .unwrap_or(rest.len());
+    let end = rest.find([',', '}', ']']).unwrap_or(rest.len());
     let token = rest[..end].trim();
     *at += end;
     Some(match token {
@@ -416,7 +414,10 @@ fn split_thinking(output: &str) -> Option<(String, String)> {
 
     let body = start + open.len();
     let (reasoning, tail) = match output[body..].find(close) {
-        Some(rel) => (&output[body..body + rel], &output[body + rel + close.len()..]),
+        Some(rel) => (
+            &output[body..body + rel],
+            &output[body + rel + close.len()..],
+        ),
         None => (&output[body..], ""),
     };
 
@@ -552,7 +553,8 @@ mod tests {
     #[test]
     fn parse_gemma_tool_calls_no_arguments() {
         // The shape Gemma-4 actually emitted in the e2e tool roundtrip.
-        let raw = "<|channel>thought\nI should call it.<channel|><|tool_call>call:get_time{}<tool_call|>";
+        let raw =
+            "<|channel>thought\nI should call it.<channel|><|tool_call>call:get_time{}<tool_call|>";
         let out = parse_gemma_tool_calls(raw).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, "get_time");
@@ -618,7 +620,10 @@ mod tests {
             AssistantContent::ToolCall(tc) => Some(tc.clone()),
             _ => None,
         });
-        assert_eq!(call.expect("expected a tool call").function.name, "get_time");
+        assert_eq!(
+            call.expect("expected a tool call").function.name,
+            "get_time"
+        );
     }
 
     #[test]
@@ -666,6 +671,9 @@ mod tests {
         let has_reasoning = content
             .iter()
             .any(|c| matches!(c, AssistantContent::Reasoning(_)));
-        assert!(has_reasoning, "expected reasoning content, got: {content:?}");
+        assert!(
+            has_reasoning,
+            "expected reasoning content, got: {content:?}"
+        );
     }
 }

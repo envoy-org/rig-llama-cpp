@@ -20,6 +20,39 @@ from `llama-cpp-2`. A new upstream `ggml_type` is therefore an additive
 `0.1.x` change here (we add a corresponding shim variant), not a breaking
 release.
 
+## [0.5.0] — 2026-07-26
+
+### Changed
+
+- **Bumped `llama-cpp-2` / `llama-cpp-sys-2` to `0.1.152`.** Upstream `0.1.152`
+  replaced the all-in-one `LlamaSampler::llguidance(model, kind, data)`
+  constructor with a bring-your-own-`Matcher` API: callers now build the
+  token environment (`LlamaSampler::llguidance_tok_env`), a
+  `ParserFactory`, and a `Matcher` themselves, then convert it with
+  `LlamaSampler::from`. That pipeline lives in `build_schema_sampler`
+  (`src/sampling.rs`), and `llguidance` is now a direct dependency pinned to
+  the `1.7` line `llama-cpp-2` resolves — the `Matcher` crosses the crate
+  boundary, so both must see the same `llguidance` / `toktrie`. Behaviour of
+  `json_schema` requests is unchanged, including the fall back to
+  unconstrained sampling when a schema cannot be compiled.
+
+  Nothing else in `0.1.151` / `0.1.152` is breaking for this crate: the MTP
+  speculative-decoding API, the model-load progress callback, the extra
+  KV-cache and `seq_state` bindings, the tensor-buft-override accessor, and
+  the `mkl` feature are all additive.
+
+### Performance
+
+- **The llguidance token environment is built once per loaded model instead
+  of once per request.** Building it walks the whole vocabulary and
+  detokenizes every id — hundreds of milliseconds on a large vocab — and the
+  pre-`0.1.152` API did that inside every `LlamaSampler::llguidance()` call,
+  so every structured-output request paid it. It depends only on the
+  vocabulary, so it is now cached in `WorkerModel` behind a `OnceCell` and
+  shared by all later requests; a model reload drops it along with the
+  vocabulary it describes. Initialisation stays lazy, so callers that never
+  pass a JSON schema never pay the cost at all.
+
 ## [0.4.1] — 2026-07-26
 
 ### Fixed

@@ -43,6 +43,9 @@ enum LoopOutcome {
 pub(crate) struct RunCtx<'a, 'm> {
     pub(crate) backend: &'m llama_cpp_2::llama_backend::LlamaBackend,
     pub(crate) model: &'m llama_cpp_2::model::LlamaModel,
+    /// The loaded model's llguidance token-environment cache, borrowed from
+    /// the [`WorkerModel`] so it survives across requests.
+    pub(crate) tok_env: &'m std::cell::OnceCell<llguidance::toktrie::TokEnv>,
     pub(crate) n_ctx: u32,
     pub(crate) kv_cache: &'a KvCacheParams,
     pub(crate) checkpoint_params: CheckpointParams,
@@ -52,6 +55,14 @@ pub(crate) struct RunCtx<'a, 'm> {
     /// prefill and per-token in the sampler loop so [`Client::drop`] returns
     /// promptly even when a long generation is in flight.
     pub(crate) cancel: &'a AtomicBool,
+}
+
+impl RunCtx<'_, '_> {
+    /// The model paired with its token-environment cache, as the sampler
+    /// wants it.
+    pub(crate) fn model_env(&self) -> crate::sampling::ModelEnv<'_> {
+        crate::sampling::ModelEnv::new(self.model, self.tok_env)
+    }
 }
 
 /// Bringup parameters for [`inference_worker`]. Folded into a struct so the
@@ -94,6 +105,7 @@ fn handle_until_reload<'m>(
                 let ctx = RunCtx {
                     backend,
                     model: &wm.model,
+                    tok_env: &wm.tok_env,
                     n_ctx: wm.n_ctx,
                     kv_cache: &wm.kv_cache,
                     checkpoint_params,
@@ -339,7 +351,7 @@ fn run_text_inference<'m>(
     let cached_tokens = effective_cached as u64;
 
     let result = sample_tokens(
-        ctx.model,
+        &ctx.model_env(),
         &mut p.ctx,
         &mut batch,
         &prompt_build,

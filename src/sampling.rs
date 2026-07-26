@@ -51,6 +51,90 @@ fn sample_one(
     token
 }
 
+/// The loaded model plus its lazily-built llguidance token environment.
+///
+/// Building the token environment walks the entire vocabulary and detokenizes
+/// every id (up to two FFI calls per token) — on the order of hundreds of
+/// milliseconds for a large vocab. It depends only on the vocabulary, so it is
+/// built at most once per loaded model and shared by every request from then
+/// on; `llama-cpp-2` 0.1.152's `llguidance_tok_env` doc explicitly asks callers
+/// to cache it this way. (The pre-0.1.152 API rebuilt it inside every
+/// `LlamaSampler::llguidance()` call.)
+///
+/// The cell lives in [`crate::loader::WorkerModel`], so a model reload drops it
+/// along with the model it describes — which is required for correctness, since
+/// the replacement model has a different vocabulary.
+///
+/// Initialisation is deferred because only structured-output requests need it:
+/// a caller that never passes a JSON schema never pays the cost.
+pub(crate) struct ModelEnv<'a> {
+    model: &'a llama_cpp_2::model::LlamaModel,
+    tok_env: &'a std::cell::OnceCell<llguidance::toktrie::TokEnv>,
+}
+
+impl<'a> ModelEnv<'a> {
+    pub(crate) fn new(
+        model: &'a llama_cpp_2::model::LlamaModel,
+        tok_env: &'a std::cell::OnceCell<llguidance::toktrie::TokEnv>,
+    ) -> Self {
+        Self { model, tok_env }
+    }
+
+    pub(crate) fn model(&self) -> &'a llama_cpp_2::model::LlamaModel {
+        self.model
+    }
+
+    fn tok_env(&self) -> &llguidance::toktrie::TokEnv {
+        self.tok_env.get_or_init(|| {
+            log::debug!("building llguidance token environment (once per loaded model)");
+            llama_cpp_2::sampling::LlamaSampler::llguidance_tok_env(self.model)
+        })
+    }
+}
+
+/// Build the llguidance sampler constraining generation to `schema`.
+///
+/// `llama-cpp-2` 0.1.152 replaced the all-in-one `LlamaSampler::llguidance()`
+/// constructor with a bring-your-own-`Matcher` API, so the grammar → parser →
+/// matcher pipeline it used to hide lives here now. The upside is that the
+/// expensive half — the token environment — is no longer rebuilt per request;
+/// `tok_env` hands us the one cached for the loaded model.
+///
+/// Returns `None` (rather than an error) if the schema is unusable, so an
+/// unconstrained generation still happens instead of failing the request.
+fn build_schema_sampler(
+    tok_env: &llguidance::toktrie::TokEnv,
+    schema: &str,
+) -> Option<llama_cpp_2::sampling::LlamaSampler> {
+    use llguidance::api::TopLevelGrammar;
+    use llguidance::{Matcher, ParserFactory};
+
+    let build = || -> Result<Matcher, String> {
+        // The "json" tag makes llguidance read `schema` as a JSON Schema.
+        let grammar = TopLevelGrammar::from_tagged_str("json", schema)
+            .map_err(|e| format!("invalid json schema: {e}"))?;
+        let factory =
+            ParserFactory::new_simple(tok_env).map_err(|e| format!("parser factory: {e}"))?;
+        let parser = factory
+            .create_parser(grammar)
+            .map_err(|e| format!("parser: {e}"))?;
+        Ok(Matcher::new(Ok(parser)))
+    };
+
+    match build() {
+        Ok(matcher) => {
+            log::debug!("llguidance json-schema sampler created");
+            Some(matcher.into())
+        }
+        Err(e) => {
+            log::warn!(
+                "llguidance sampler creation failed, falling back to unconstrained sampling: {e}"
+            );
+            None
+        }
+    }
+}
+
 /// Build a sampler chain, prepending an llguidance JSON-schema constraint when
 /// the request carries an `output_schema`.
 ///
@@ -60,7 +144,7 @@ fn sample_one(
 /// and structured-output (`json_schema`) constraints are applied via the
 /// llguidance sampler, which accepts a JSON schema directly.
 fn build_sampler_chain(
-    model: &llama_cpp_2::model::LlamaModel,
+    env: &ModelEnv<'_>,
     req: &InferenceParams,
 ) -> (llama_cpp_2::sampling::LlamaSampler, bool) {
     use llama_cpp_2::sampling::LlamaSampler;
@@ -74,22 +158,11 @@ fn build_sampler_chain(
         LlamaSampler::dist(42),
     ];
 
-    // JSON-schema constrained generation via llguidance. The schema string is
-    // the serialized JSON Schema; llguidance's "json" tag parses it directly.
-    let schema_sampler = req.prepared_request.json_schema.as_deref().and_then(|schema| {
-        match LlamaSampler::llguidance(model, "json", schema) {
-            Ok(s) => {
-                log::debug!("llguidance json-schema sampler created");
-                Some(s)
-            }
-            Err(e) => {
-                log::warn!(
-                    "llguidance sampler creation failed, falling back to unconstrained sampling: {e}"
-                );
-                None
-            }
-        }
-    });
+    let schema_sampler = req
+        .prepared_request
+        .json_schema
+        .as_deref()
+        .and_then(|schema| build_schema_sampler(env.tok_env(), schema));
 
     let has_schema = schema_sampler.is_some();
     let mut samplers = Vec::with_capacity(base_samplers.len() + 1);
@@ -103,7 +176,7 @@ fn build_sampler_chain(
 #[cfg(feature = "mtmd")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sample_tokens_from_pos(
-    model: &llama_cpp_2::model::LlamaModel,
+    env: &ModelEnv<'_>,
     ctx: &mut llama_cpp_2::context::LlamaContext,
     batch: &mut llama_cpp_2::llama_batch::LlamaBatch,
     _prompt_build: &PromptBuildResult,
@@ -116,7 +189,7 @@ pub(crate) fn sample_tokens_from_pos(
     cancel: &AtomicBool,
 ) -> Result<InferenceResult, String> {
     let (output, choice, completion_tokens) = sample_loop(
-        model,
+        env,
         ctx,
         batch,
         req,
@@ -136,7 +209,7 @@ pub(crate) fn sample_tokens_from_pos(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sample_tokens(
-    model: &llama_cpp_2::model::LlamaModel,
+    env: &ModelEnv<'_>,
     ctx: &mut llama_cpp_2::context::LlamaContext,
     batch: &mut llama_cpp_2::llama_batch::LlamaBatch,
     _prompt_build: &PromptBuildResult,
@@ -150,7 +223,7 @@ pub(crate) fn sample_tokens(
     // Text path: generation resumes right after the prompt tokens.
     let n_past = prompt_tokens as i32;
     let (output, choice, completion_tokens) = sample_loop(
-        model,
+        env,
         ctx,
         batch,
         req,
@@ -175,7 +248,7 @@ pub(crate) fn sample_tokens(
 /// Returns `(output_text, AssistantContent choice, completion_token_count)`.
 #[allow(clippy::too_many_arguments)]
 fn sample_loop(
-    model: &llama_cpp_2::model::LlamaModel,
+    env: &ModelEnv<'_>,
     ctx: &mut llama_cpp_2::context::LlamaContext,
     batch: &mut llama_cpp_2::llama_batch::LlamaBatch,
     req: &InferenceParams,
@@ -184,7 +257,7 @@ fn sample_loop(
     last_entries: &mut Vec<SlotEntry>,
     cancel: &AtomicBool,
 ) -> Result<(String, OneOrMany<AssistantContent>, u64), String> {
-    let (mut sampler, has_schema) = build_sampler_chain(model, req);
+    let (mut sampler, has_schema) = build_sampler_chain(env, req);
 
     let has_tools = req.prepared_request.tools_json.is_some();
     let has_schema_request = req.prepared_request.json_schema.is_some();
@@ -224,11 +297,12 @@ fn sample_loop(
         };
         let token = sample_one(ctx, &mut sampler, sample_idx, has_schema);
 
-        if model.is_eog_token(token) {
+        if env.model().is_eog_token(token) {
             break;
         }
 
-        let piece = token_piece_or_empty(model.token_to_piece(token, &mut decoder, false, None))?;
+        let piece =
+            token_piece_or_empty(env.model().token_to_piece(token, &mut decoder, false, None))?;
         output.push_str(&piece);
         completion_tokens += 1;
 
