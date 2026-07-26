@@ -20,6 +20,52 @@ from `llama-cpp-2`. A new upstream `ggml_type` is therefore an additive
 `0.1.x` change here (we add a corresponding shim variant), not a breaking
 release.
 
+## [0.4.1] — 2026-07-26
+
+### Fixed
+
+- **Streaming structured output no longer emits the JSON object twice.** A
+  `json_schema` request without tools streamed every token piece as it was
+  sampled *and* then emitted the whole cleaned object again as a corrective
+  chunk, so consumers concatenating the stream got the object back-to-back and
+  `serde_json` rejected it with "trailing characters". Structured-output turns
+  now buffer like tool-calling turns and emit exactly one cleaned chunk, which
+  also keeps the streamed text identical to the aggregated assistant message.
+  When no balanced object can be extracted the raw output is emitted instead,
+  so a failed extraction can no longer end a stream with no text at all.
+
+- **Models whose chat template llama.cpp cannot apply are no longer prompted
+  with the wrong format.** `apply_chat_template` is llama.cpp's *non-jinja*
+  applier: it recognises a fixed set of known template shapes and returns `-1`
+  for anything else. Models shipping a bespoke jinja template — Gemma-4, whose
+  template renders `<|turn>role` turns — failed it and were silently downgraded
+  to ChatML, a format they were never trained on. Such templates are now
+  rendered with `minijinja` (new dependency) before ChatML is considered, and a
+  genuinely unusable template warns instead of failing quietly. llama.cpp's
+  applier remains the primary path, so every model it already handles renders
+  byte-for-byte as before.
+
+- **`enable_thinking` is no longer inert.** The flag parsed from
+  `additional_params` (`{"thinking": true}`) had nowhere to go once
+  `llama-cpp-2` 0.1.147 dropped `chat_template_kwargs`, so templates gating
+  reasoning behind it — Gemma-4 defaults it to `false` — never produced any.
+  It is now forwarded as a real template variable on the minijinja path. On
+  llama.cpp's own path it necessarily stays advisory: that C API takes only
+  `(role, content)` pairs.
+
+- **Gemma-4's native tool-call dialect is now parsed.** Prompted in its own
+  turn format, Gemma emits `<|tool_call>call:name{k:v}<tool_call|>` — a bespoke
+  DSL, not JSON — rather than the portable `<tool_call>` protocol the injected
+  system directive asks for, so tool calls were silently missed.
+  `parse_tool_calls` now recognises it alongside the existing formats,
+  including its `<|"|>`-delimited strings and nested objects/arrays.
+
+- **Reasoning is recognised beyond `<think>`.** `split_thinking` matched only
+  `<think>…</think>`, so Gemma-4's `<|channel>thought…<channel|>` never
+  surfaced as `AssistantContent::Reasoning`. Both markers are now understood,
+  and a block left unterminated by the token cap is treated as reasoning to the
+  end rather than being dropped.
+
 ## [0.4.0] — 2026-07-26
 
 ### Changed

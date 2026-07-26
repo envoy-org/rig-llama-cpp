@@ -111,12 +111,13 @@ pub(crate) struct PreparedRequest {
     pub tool_choice: Option<String>,
     pub json_schema: Option<String>,
     /// Parsed from the request's `additional_params` (`{ "thinking": bool }`).
-    /// `llama-cpp-2` 0.1.147 dropped the `chat_template_kwargs` plumbing the
-    /// old oaicompat path used to forward this to the jinja engine, so the
-    /// flag is currently advisory: thinking-enabled is the template default
-    /// and continues to work; thinking-disabled can no longer be enforced
-    /// through the template and is surfaced only via the model's defaults.
-    #[allow(dead_code)]
+    ///
+    /// Forwarded to the template as the `enable_thinking` variable, but only on
+    /// the minijinja path (`src/jinja.rs`). llama.cpp's own applier takes just
+    /// `(role, content)` pairs — `llama-cpp-2` 0.1.147 dropped the
+    /// `chat_template_kwargs` plumbing the old oaicompat path used — so for a
+    /// model llama.cpp can template natively this flag stays advisory and the
+    /// template's own default decides.
     pub enable_thinking: bool,
     #[cfg(feature = "mtmd")]
     pub images: Vec<PreparedImage>,

@@ -1,6 +1,6 @@
 [package]
 name = "rig-llama-cpp"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Rig completion provider for local GGUF models via llama.cpp, with streaming, tool calling, reasoning, and multimodal (mtmd) support."
@@ -49,6 +49,7 @@ chrono = "0.4.44"
 tokio-stream = "0.1"
 log = "0.4"
 base64 = { version = "0.22", optional = true }
+minijinja = "2.21.0"
 
 [dev-dependencies]
 schemars = "1"

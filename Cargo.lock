@@ -1284,6 +1284,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memo-map"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38d1115007560874e373613744c6fba374c17688327a71c1476d1a5954cc857b"
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1297,6 +1303,16 @@ checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
 dependencies = [
  "mime",
  "unicase",
+]
+
+[[package]]
+name = "minijinja"
+version = "2.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb3d648e68cea56d9858d535ee28f9538404e2dd8cb08ed0bd05dca379477f39"
+dependencies = [
+ "memo-map",
+ "serde",
 ]
 
 [[package]]
@@ -1887,7 +1903,7 @@ dependencies = [
 
 [[package]]
 name = "rig-llama-cpp"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -1897,6 +1913,7 @@ dependencies = [
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "log",
+ "minijinja",
  "rig-core",
  "schemars",
  "serde",

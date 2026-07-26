@@ -94,7 +94,8 @@ pub(crate) fn parse_completion_output(
 /// Unified tool-call parser. Tries, in order:
 ///
 /// 1. `<tool_call>` blocks (Qwen-style XML parameter form or JSON form).
-/// 2. Bare / markdown-fenced JSON objects shaped like
+/// 2. Gemma-4's native `<|tool_call>call:NAME{...}<tool_call|>` DSL.
+/// 3. Bare / markdown-fenced JSON objects shaped like
 ///    `{"name": ..., "arguments": ...}`.
 ///
 /// Returns the first format that yields at least one tool call, so a response
@@ -102,6 +103,9 @@ pub(crate) fn parse_completion_output(
 pub(crate) fn parse_tool_calls(output: &str) -> Option<Vec<(String, Value)>> {
     if let Some(xml) = parse_xml_tool_calls(output) {
         return Some(xml);
+    }
+    if let Some(gemma) = parse_gemma_tool_calls(output) {
+        return Some(gemma);
     }
     // Bare / markdown-fenced JSON. Models that ignore the `<tool_call>`
     // directive often emit a fenced ```json block instead.
@@ -161,6 +165,169 @@ pub(crate) fn parse_xml_tool_calls(output: &str) -> Option<Vec<(String, Value)>>
         None
     } else {
         Some(results)
+    }
+}
+
+/// Gemma-4 opens and closes strings with this same token, quote-style.
+const GEMMA_STRING_DELIM: &str = "<|\"|>";
+
+/// Tool-call markers, longest-first so `<|tool_call>` is never mistaken for
+/// `<tool_call>`. Used to locate prose preceding the first call.
+pub(crate) const TOOL_CALL_MARKERS: &[&str] = &["<|tool_call>", "<tool_call>"];
+
+/// Parse Gemma-4's native tool-call blocks.
+///
+/// Gemma reverts to this format — rather than the portable `<tool_call>` JSON
+/// directive injected into the system prompt — whenever it is prompted in its
+/// own turn format, because that is what it was trained to emit:
+///
+/// ```text
+/// <|tool_call>call:write_file{path:<|"|>a.txt<|"|>,retries:2}<tool_call|>
+/// ```
+///
+/// Arguments are a bespoke DSL, not JSON: strings are wrapped in
+/// `<|"|>` on both sides, `null` / `true` / `false` and bare numbers are
+/// literals, and objects/arrays nest with `{k:v,...}` / `[a,b]`. Top-level
+/// argument keys are unquoted; nested keys are string-wrapped.
+pub(crate) fn parse_gemma_tool_calls(output: &str) -> Option<Vec<(String, Value)>> {
+    let mut results = Vec::new();
+
+    for block in output.split("<|tool_call>").skip(1) {
+        let block = block.split("<tool_call|>").next().unwrap_or(block).trim();
+        // The template writes `call:` before the function name.
+        let block = block.strip_prefix("call:").unwrap_or(block);
+
+        let Some(brace) = block.find('{') else {
+            continue;
+        };
+        let name = block[..brace].trim();
+        if name.is_empty() {
+            continue;
+        }
+
+        let mut at = brace;
+        let arguments = parse_gemma_value(block, &mut at).unwrap_or(Value::Null);
+        results.push((name.to_string(), arguments));
+    }
+
+    if results.is_empty() {
+        None
+    } else {
+        Some(results)
+    }
+}
+
+fn skip_gemma_ws(s: &str, at: &mut usize) {
+    while let Some(c) = s[*at..].chars().next() {
+        if c.is_whitespace() {
+            *at += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+}
+
+/// Read one value of Gemma's argument DSL starting at `at`, advancing it past
+/// what was consumed.
+fn parse_gemma_value(s: &str, at: &mut usize) -> Option<Value> {
+    skip_gemma_ws(s, at);
+    let rest = s.get(*at..)?;
+
+    if let Some(body) = rest.strip_prefix(GEMMA_STRING_DELIM) {
+        let end = body.find(GEMMA_STRING_DELIM)?;
+        *at += GEMMA_STRING_DELIM.len() + end + GEMMA_STRING_DELIM.len();
+        return Some(Value::String(body[..end].to_string()));
+    }
+
+    if rest.starts_with('{') {
+        *at += 1;
+        let mut map = serde_json::Map::new();
+        loop {
+            skip_gemma_ws(s, at);
+            let rest = s.get(*at..)?;
+            if let Some(stripped) = rest.strip_prefix('}') {
+                let _ = stripped;
+                *at += 1;
+                break;
+            }
+            if rest.is_empty() {
+                return None;
+            }
+            let key = parse_gemma_key(s, at)?;
+            skip_gemma_ws(s, at);
+            if !s.get(*at..)?.starts_with(':') {
+                return None;
+            }
+            *at += 1;
+            let value = parse_gemma_value(s, at)?;
+            map.insert(key, value);
+            skip_gemma_ws(s, at);
+            if s.get(*at..)?.starts_with(',') {
+                *at += 1;
+            }
+        }
+        return Some(Value::Object(map));
+    }
+
+    if rest.starts_with('[') {
+        *at += 1;
+        let mut items = Vec::new();
+        loop {
+            skip_gemma_ws(s, at);
+            let rest = s.get(*at..)?;
+            if rest.starts_with(']') {
+                *at += 1;
+                break;
+            }
+            if rest.is_empty() {
+                return None;
+            }
+            items.push(parse_gemma_value(s, at)?);
+            skip_gemma_ws(s, at);
+            if s.get(*at..)?.starts_with(',') {
+                *at += 1;
+            }
+        }
+        return Some(Value::Array(items));
+    }
+
+    // Bare scalar: runs until the next structural character.
+    let end = rest
+        .find([',', '}', ']'])
+        .unwrap_or(rest.len());
+    let token = rest[..end].trim();
+    *at += end;
+    Some(match token {
+        "null" => Value::Null,
+        "true" => Value::Bool(true),
+        "false" => Value::Bool(false),
+        _ => token
+            .parse::<i64>()
+            .map(Value::from)
+            .or_else(|_| token.parse::<f64>().map(Value::from))
+            .unwrap_or_else(|_| Value::String(token.to_string())),
+    })
+}
+
+/// Object keys are either string-wrapped (nested objects) or bare (top-level
+/// argument names, which the template renders with `escape_keys=False`).
+fn parse_gemma_key(s: &str, at: &mut usize) -> Option<String> {
+    skip_gemma_ws(s, at);
+    let rest = s.get(*at..)?;
+
+    if let Some(body) = rest.strip_prefix(GEMMA_STRING_DELIM) {
+        let end = body.find(GEMMA_STRING_DELIM)?;
+        *at += GEMMA_STRING_DELIM.len() + end + GEMMA_STRING_DELIM.len();
+        return Some(body[..end].to_string());
+    }
+
+    let end = rest.find(':')?;
+    *at += end;
+    let key = rest[..end].trim();
+    if key.is_empty() {
+        None
+    } else {
+        Some(key.to_string())
     }
 }
 
@@ -227,20 +394,38 @@ fn parse_parameter_form(block: &str) -> Option<(String, Value)> {
     }
 }
 
-/// Split `<think>...</think>` reasoning from the visible response. Returns
-/// `(reasoning, text)` when a thinking block is present.
+/// Reasoning delimiters, as `(open, close)` pairs, for the model families this
+/// crate targets. Models disagree on the markup, so we recognise each shape
+/// rather than assuming the `<think>` convention is universal.
+const THINKING_MARKERS: &[(&str, &str)] = &[
+    // Qwen, DeepSeek-R1, and most reasoning models.
+    ("<think>", "</think>"),
+    // Gemma-4's thought channel.
+    ("<|channel>thought", "<channel|>"),
+];
+
+/// Split reasoning from the visible response. Returns `(reasoning, text)` when
+/// a thinking block is present, using whichever known marker pair appears
+/// first. An unterminated block — the token cap hit mid-thought — is treated as
+/// reasoning all the way to the end, leaving no visible text.
 fn split_thinking(output: &str) -> Option<(String, String)> {
-    let start = output.find("<think>")?;
-    let end = output.find("</think>").unwrap_or(output.len());
-    let reasoning = output[start + "<think>".len()..end].trim().to_string();
-    let mut text = String::new();
+    let (open, close, start) = THINKING_MARKERS
+        .iter()
+        .filter_map(|&(open, close)| output.find(open).map(|at| (open, close, at)))
+        .min_by_key(|&(_, _, at)| at)?;
+
+    let body = start + open.len();
+    let (reasoning, tail) = match output[body..].find(close) {
+        Some(rel) => (&output[body..body + rel], &output[body + rel + close.len()..]),
+        None => (&output[body..], ""),
+    };
+
+    let mut text = String::with_capacity(start + tail.len());
     text.push_str(&output[..start]);
-    if end < output.len() {
-        text.push_str(&output[end.min(output.len())..]);
-    }
-    // Also strip the `</think>` tag itself if present.
-    let text = text.replace("</think>", "");
-    Some((reasoning, text.trim().to_string()))
+    text.push_str(tail);
+    // Defensive: drop any stray closer left by a second block.
+    let text = text.replace(close, "");
+    Some((reasoning.trim().to_string(), text.trim().to_string()))
 }
 
 #[cfg(test)]
@@ -365,10 +550,122 @@ mod tests {
     }
 
     #[test]
+    fn parse_gemma_tool_calls_no_arguments() {
+        // The shape Gemma-4 actually emitted in the e2e tool roundtrip.
+        let raw = "<|channel>thought\nI should call it.<channel|><|tool_call>call:get_time{}<tool_call|>";
+        let out = parse_gemma_tool_calls(raw).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "get_time");
+        assert_eq!(out[0].1, serde_json::json!({}));
+    }
+
+    #[test]
+    fn parse_gemma_tool_calls_scalar_arguments() {
+        let raw = "<|tool_call>call:write_file{path:<|\"|>a.txt<|\"|>,retries:2,force:true,note:null}<tool_call|>";
+        let out = parse_gemma_tool_calls(raw).unwrap();
+        assert_eq!(out[0].0, "write_file");
+        assert_eq!(out[0].1["path"], "a.txt");
+        assert_eq!(out[0].1["retries"], 2);
+        assert_eq!(out[0].1["force"], true);
+        assert_eq!(out[0].1["note"], Value::Null);
+    }
+
+    #[test]
+    fn parse_gemma_tool_calls_nested_and_sequence_arguments() {
+        // Nested keys are string-wrapped; sequences use [a,b].
+        let raw = "<|tool_call>call:cfg{opts:{<|\"|>depth<|\"|>:3},tags:[<|\"|>a<|\"|>,<|\"|>b<|\"|>]}<tool_call|>";
+        let out = parse_gemma_tool_calls(raw).unwrap();
+        assert_eq!(out[0].1["opts"]["depth"], 3);
+        assert_eq!(out[0].1["tags"], serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn parse_gemma_tool_calls_multiple_blocks() {
+        let raw = "<|tool_call>call:a{}<tool_call|><|tool_call>call:b{x:1}<tool_call|>";
+        let out = parse_gemma_tool_calls(raw).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, "a");
+        assert_eq!(out[1].0, "b");
+        assert_eq!(out[1].1["x"], 1);
+    }
+
+    #[test]
+    fn parse_gemma_tool_calls_preserves_braces_inside_strings() {
+        let raw = "<|tool_call>call:echo{msg:<|\"|>a{b},c<|\"|>}<tool_call|>";
+        let out = parse_gemma_tool_calls(raw).unwrap();
+        assert_eq!(out[0].1["msg"], "a{b},c");
+    }
+
+    #[test]
+    fn parse_gemma_tool_calls_returns_none_without_blocks() {
+        assert!(parse_gemma_tool_calls("just prose").is_none());
+        // A Qwen-style block must not be picked up by the Gemma parser.
+        assert!(parse_gemma_tool_calls("<tool_call>{\"name\":\"a\"}</tool_call>").is_none());
+    }
+
+    #[test]
+    fn parse_tool_calls_dispatches_to_the_gemma_dialect() {
+        let raw = "<|tool_call>call:get_time{}<tool_call|>";
+        let out = parse_tool_calls(raw).unwrap();
+        assert_eq!(out[0].0, "get_time");
+    }
+
+    #[test]
+    fn parse_completion_output_surfaces_gemma_tool_call() {
+        let raw = "<|channel>thought\nreasoning<channel|><|tool_call>call:get_time{}<tool_call|>";
+        let content = parse_completion_output(raw, false).unwrap();
+        let call = content.iter().find_map(|c| match c {
+            AssistantContent::ToolCall(tc) => Some(tc.clone()),
+            _ => None,
+        });
+        assert_eq!(call.expect("expected a tool call").function.name, "get_time");
+    }
+
+    #[test]
     fn split_thinking_extracts_reasoning() {
         let raw = "<think>let me consider</think>The answer is 42.";
         let (reasoning, text) = split_thinking(raw).unwrap();
         assert_eq!(reasoning, "let me consider");
         assert_eq!(text, "The answer is 42.");
+    }
+
+    #[test]
+    fn split_thinking_extracts_gemma_thought_channel() {
+        let raw = "<|channel>thought\nweigh the options\n<channel|>The answer is 42.";
+        let (reasoning, text) = split_thinking(raw).unwrap();
+        assert_eq!(reasoning, "weigh the options");
+        assert_eq!(text, "The answer is 42.");
+    }
+
+    #[test]
+    fn split_thinking_handles_unterminated_block() {
+        // Token cap hit mid-thought: everything is reasoning, no visible text.
+        let raw = "<think>still working through it";
+        let (reasoning, text) = split_thinking(raw).unwrap();
+        assert_eq!(reasoning, "still working through it");
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn split_thinking_keeps_prose_before_the_block() {
+        let raw = "Sure.<think>hmm</think>Done.";
+        let (reasoning, text) = split_thinking(raw).unwrap();
+        assert_eq!(reasoning, "hmm");
+        assert_eq!(text, "Sure.Done.");
+    }
+
+    #[test]
+    fn split_thinking_returns_none_without_markers() {
+        assert!(split_thinking("just a plain answer").is_none());
+    }
+
+    #[test]
+    fn parse_completion_output_surfaces_gemma_reasoning() {
+        let raw = "<|channel>thought\nreason about it\n<channel|>Because of Rayleigh scattering.";
+        let content = parse_completion_output(raw, false).unwrap();
+        let has_reasoning = content
+            .iter()
+            .any(|c| matches!(c, AssistantContent::Reasoning(_)));
+        assert!(has_reasoning, "expected reasoning content, got: {content:?}");
     }
 }

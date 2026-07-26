@@ -70,6 +70,7 @@ mod embedding;
 mod error;
 #[cfg(feature = "mtmd")]
 mod image;
+mod jinja;
 mod loader;
 mod parsing;
 mod prompt;

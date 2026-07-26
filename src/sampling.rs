@@ -191,7 +191,15 @@ fn sample_loop(
     // Tool-calling turns buffer the whole generation: the model may emit
     // `<tool_call>` XML that we must parse whole before emitting anything, so
     // consumers don't see the raw tool-call text as message deltas.
-    let buffer_output = has_tools;
+    //
+    // Structured-output turns buffer for the same reason. `flush_stream` emits
+    // one corrective chunk carrying the *cleaned* JSON, so streaming the raw
+    // pieces here as well would deliver the object twice — once raw, once
+    // cleaned. Buffering also keeps the streamed text identical to the cleaned
+    // JSON even when the llguidance sampler could not be built and generation
+    // ran unconstrained, which is exactly when the raw output is most likely to
+    // carry markdown fences or role tokens.
+    let buffer_output = has_tools || has_schema_request;
 
     let mut output = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
@@ -224,8 +232,8 @@ fn sample_loop(
         output.push_str(&piece);
         completion_tokens += 1;
 
-        // Stream incremental text only when not buffering a tool-call turn.
-        // For structured output the pieces are JSON tokens and stream fine.
+        // Stream incremental text only when not buffering. Buffered turns
+        // (tool calls, structured output) emit in `flush_stream` instead.
         if let Some(tx) = stream_tx
             && !buffer_output
         {
@@ -254,24 +262,32 @@ fn sample_loop(
 
 /// Emit the tail of a stream after generation completes.
 ///
-/// - **json_schema**: emit a single corrective chunk containing the cleaned
-///   JSON (strips role tokens / markdown fences the template may leak).
+/// - **json_schema**: emit a single chunk containing the cleaned JSON (strips
+///   role tokens / markdown fences the template may leak). The turn was
+///   buffered, so this is the only text the consumer receives — if no balanced
+///   object can be extracted we fall back to the raw output rather than
+///   finishing the stream with no text at all.
 /// - **tools**: parse the buffered output for tool calls and emit complete
 ///   `ToolCall` events. Any leading prose before the first `<tool_call>` is
 ///   also surfaced as a message chunk.
 /// - **plain text**: nothing to flush (text was streamed incrementally).
 fn flush_stream(tx: &StreamSender, output: &str, has_tools: bool, has_schema: bool) {
     if has_schema {
-        if let Some(json) = extract_structured_json(output) {
-            let _ = tx.send(Ok(RawStreamingChoice::Message(json)));
+        let text = extract_structured_json(output).unwrap_or_else(|| output.to_string());
+        if !text.is_empty() {
+            let _ = tx.send(Ok(RawStreamingChoice::Message(text)));
         }
         return;
     }
 
     if has_tools {
         if let Some(tool_calls) = parse_tool_calls(output) {
-            // Surface any prose preceding the first tool call as text.
-            if let Some(prefix_end) = output.find("<tool_call>")
+            // Surface any prose preceding the first tool call as text. Models
+            // disagree on the marker, so take the earliest one that appears.
+            if let Some(prefix_end) = crate::parsing::TOOL_CALL_MARKERS
+                .iter()
+                .filter_map(|marker| output.find(marker))
+                .min()
                 && !output[..prefix_end].trim().is_empty()
             {
                 let _ = tx.send(Ok(RawStreamingChoice::Message(
