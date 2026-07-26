@@ -20,6 +20,51 @@ from `llama-cpp-2`. A new upstream `ggml_type` is therefore an additive
 `0.1.x` change here (we add a corresponding shim variant), not a breaking
 release.
 
+## [0.4.0] — 2026-07-26
+
+### Changed
+
+- **Bumped `rig-core` to `0.40.0`.** The crate's own source needed no changes —
+  every upstream break landed on the *consumer* side of the API (tool authoring
+  and the agent stream), not on the provider side this crate implements. Because
+  `rig-core` is a public dependency, the bump is still a breaking `0.Y` release
+  for downstream users, who must move to `rig-core` 0.40 in lockstep. The
+  upstream breaks that touch code written against this crate:
+  - **`Tool::definition()` is gone.** Tool authors now implement flat metadata
+    directly: `fn description(&self) -> String` and
+    `fn parameters(&self) -> serde_json::Value`. Rig builds the provider-facing
+    `ToolDefinition` itself when the tool is registered on an agent, so the
+    `rig_core::completion::ToolDefinition` import usually disappears with it.
+    The bundled examples are updated accordingly.
+  - **`agent::FinalResponse` is replaced by `agent::PromptResponse`**, the
+    unified result type now shared with the blocking prompt surface.
+    `MultiTurnStreamItem::FinalResponse` carries it. `empty()` and `usage()`
+    carry over unchanged; `response()` is now `output()`.
+  - **`StreamedAssistantContent` gained an `Unknown(serde_json::Value)`
+    variant**, carrying provider-native output items that Rig does not model
+    (hosted-tool results and the like) rather than dropping them silently.
+    Exhaustive `match`es over the enum need a new arm. This adapter never emits
+    the variant — llama.cpp has no unmodeled output items — so the arm is inert
+    here, but it is required to compile.
+  - `MultiTurnStreamItem` gained a `ToolExecutionStart` variant. The enum was
+    already `#[non_exhaustive]`, so existing wildcard arms absorb it.
+
+  Two upstream changes look like they should affect this crate but do not:
+  the new `ToolChoice::Function { name }` variant is on the *OpenAI provider's*
+  `ToolChoice`, not `rig_core::message::ToolChoice`, so `prepare_request`'s
+  exhaustive match is untouched; and the `evals` module and `ProviderClient`
+  derive macro removals cover surfaces this crate never used.
+
+### Fixed
+
+- **Streaming responses now report real token usage when converted to a
+  `CompletionResponse`.** Upstream's
+  `From<StreamingCompletionResponse<R>> for CompletionResponse<Option<R>>`
+  previously hardcoded `Usage::new()` with the note that "usage is not tracked
+  in streaming responses"; it now derives usage from the final response. Since
+  this crate's `StreamChunk` already carried prompt/completion counts through
+  its `GetTokenUsage` impl, the numbers propagate with no change on our side.
+
 ## [0.3.0] — 2026-06-28
 
 ### Changed

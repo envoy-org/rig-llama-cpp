@@ -281,6 +281,9 @@ pub async fn run_streaming_turn(
             StreamedAssistantContent::ToolCall { .. } => {}
             StreamedAssistantContent::ToolCallDelta { .. } => {}
             StreamedAssistantContent::Final(_) => {}
+            // Provider-native items rig does not model. The llama.cpp adapter
+            // never emits these, but the arm keeps the match exhaustive.
+            StreamedAssistantContent::Unknown(_) => {}
         }
     }
 
