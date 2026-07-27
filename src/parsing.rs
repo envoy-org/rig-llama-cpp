@@ -44,9 +44,71 @@ pub(crate) fn extract_structured_json(raw_text: &str) -> Option<String> {
     None
 }
 
+/// The tool schemas offered with the current request, kept around so the
+/// parameter form can be typed rather than guessed.
+///
+/// That form carries no types at all — `<parameter=fields>{"Vendor":"X"}` is
+/// just text — so a parameter declared as an object has to be parsed back into
+/// one, while a parameter declared as a string must be left exactly as written
+/// even when its text happens to read as JSON. Only the schema can tell those
+/// apart, so it travels with the parse.
+pub(crate) struct ToolSchemas(Value);
+
+impl ToolSchemas {
+    /// Parse the request's `tools_json`. `None` when there are no tools or the
+    /// JSON is unusable — parsing then falls back to a conservative guess.
+    pub(crate) fn parse(tools_json: Option<&str>) -> Option<Self> {
+        let tools: Value = serde_json::from_str(tools_json?).ok()?;
+        tools.is_array().then_some(Self(tools))
+    }
+
+    /// The declared JSON-Schema `type` of one parameter, if the request
+    /// described it. A union type (`["string", "null"]`) reports its first
+    /// non-`null` member, which is what the value has to deserialize into.
+    fn parameter_type(&self, function: &str, key: &str) -> Option<&str> {
+        let declared = self
+            .0
+            .as_array()?
+            .iter()
+            .map(|tool| tool.get("function").unwrap_or(tool))
+            .find(|f| f.get("name").and_then(Value::as_str) == Some(function))?
+            .get("parameters")?
+            .get("properties")?
+            .get(key)?
+            .get("type")?;
+        match declared {
+            Value::String(name) => Some(name.as_str()),
+            Value::Array(names) => names
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|name| *name != "null"),
+            _ => None,
+        }
+    }
+}
+
+/// Turn one parameter-form value into the JSON the tool's deserializer expects.
+///
+/// `declared` is the parameter's schema type when the request supplied one.
+/// With it the answer is exact: a `string` parameter keeps its text verbatim,
+/// anything else is parsed. Without it — an unknown tool, or a request that
+/// offered no schema — only objects and arrays are taken, so free text that
+/// happens to read as `2`, `true` or `null` is left alone.
+fn coerce_parameter(raw: &str, declared: Option<&str>) -> Value {
+    if declared == Some("string") {
+        return Value::String(raw.to_string());
+    }
+    match serde_json::from_str::<Value>(raw) {
+        Ok(parsed) if declared.is_some() => parsed,
+        Ok(parsed @ (Value::Object(_) | Value::Array(_))) => parsed,
+        _ => Value::String(raw.to_string()),
+    }
+}
+
 pub(crate) fn parse_completion_output(
     raw_text: &str,
     has_json_schema: bool,
+    schemas: Option<&ToolSchemas>,
 ) -> Result<OneOrMany<AssistantContent>, String> {
     log::debug!("raw output:\n{raw_text}");
 
@@ -62,7 +124,7 @@ pub(crate) fn parse_completion_output(
     // `parse_response_oaicompat` path from llama-cpp-2 0.1.146 was removed in
     // 0.1.147, so we rely on our own parsers here (XML `<tool_call>` blocks,
     // bare / markdown-fenced JSON).
-    if let Some(tool_calls) = parse_tool_calls(raw_text) {
+    if let Some(tool_calls) = parse_tool_calls(raw_text, schemas) {
         let mut content: Vec<AssistantContent> = Vec::new();
         for (i, (name, arguments)) in tool_calls.into_iter().enumerate() {
             content.push(AssistantContent::ToolCall(ToolCall::new(
@@ -100,8 +162,11 @@ pub(crate) fn parse_completion_output(
 ///
 /// Returns the first format that yields at least one tool call, so a response
 /// that mixes prose and a single JSON tool call still parses.
-pub(crate) fn parse_tool_calls(output: &str) -> Option<Vec<(String, Value)>> {
-    if let Some(xml) = parse_xml_tool_calls(output) {
+pub(crate) fn parse_tool_calls(
+    output: &str,
+    schemas: Option<&ToolSchemas>,
+) -> Option<Vec<(String, Value)>> {
+    if let Some(xml) = parse_xml_tool_calls(output, schemas) {
         return Some(xml);
     }
     if let Some(gemma) = parse_gemma_tool_calls(output) {
@@ -139,7 +204,10 @@ pub(crate) fn parse_tool_calls(output: &str) -> Option<Vec<(String, Value)>> {
 /// {"name": "write_file", "arguments": {"path": "output.txt"}}
 /// </tool_call>
 /// ```
-pub(crate) fn parse_xml_tool_calls(output: &str) -> Option<Vec<(String, Value)>> {
+pub(crate) fn parse_xml_tool_calls(
+    output: &str,
+    schemas: Option<&ToolSchemas>,
+) -> Option<Vec<(String, Value)>> {
     let mut results = Vec::new();
 
     for block in output.split("<tool_call>").skip(1) {
@@ -156,7 +224,7 @@ pub(crate) fn parse_xml_tool_calls(output: &str) -> Option<Vec<(String, Value)>>
         }
 
         // Parameter form fallback.
-        if let Some(tc) = parse_parameter_form(block) {
+        if let Some(tc) = parse_parameter_form(block, schemas) {
             results.push(tc);
         }
     }
@@ -359,7 +427,7 @@ fn json_value_to_tool_call(value: &Value) -> Option<(String, Value)> {
 }
 
 /// Parse the Qwen parameter form (`<function=NAME>` + `<parameter=KEY>` blocks).
-fn parse_parameter_form(block: &str) -> Option<(String, Value)> {
+fn parse_parameter_form(block: &str, schemas: Option<&ToolSchemas>) -> Option<(String, Value)> {
     let func_start = block.find("<function=")?;
     let after_eq = &block[func_start + "<function=".len()..];
     let func_name_end = after_eq.find('>')?;
@@ -381,7 +449,8 @@ fn parse_parameter_form(block: &str) -> Option<(String, Value)> {
         };
         let value = block[value_start..value_start + param_end].trim();
 
-        args.insert(key.to_string(), Value::String(value.to_string()));
+        let declared = schemas.and_then(|s| s.parameter_type(&func_name, key));
+        args.insert(key.to_string(), coerce_parameter(value, declared));
         search_from = value_start + param_end + "</parameter>".len();
     }
 
@@ -525,7 +594,7 @@ mod tests {
     #[test]
     fn parse_xml_tool_calls_json_form() {
         let raw = "<tool_call>\n{\"name\": \"get_time\", \"arguments\": {\"timezone\": \"UTC\"}}\n</tool_call>";
-        let out = parse_xml_tool_calls(raw).unwrap();
+        let out = parse_xml_tool_calls(raw, None).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, "get_time");
         assert_eq!(out[0].1["timezone"], "UTC");
@@ -534,17 +603,113 @@ mod tests {
     #[test]
     fn parse_xml_tool_calls_parameter_form() {
         let raw = "<tool_call>\n<function=write_file>\n<parameter=path>\noutput.txt\n</parameter>\n<parameter=content>\nHello\n</parameter>\n</function>\n</tool_call>";
-        let out = parse_xml_tool_calls(raw).unwrap();
+        let out = parse_xml_tool_calls(raw, None).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, "write_file");
         assert_eq!(out[0].1["path"], "output.txt");
         assert_eq!(out[0].1["content"], "Hello");
     }
 
+    /// The schema for a tool taking an object, a string, and a number — the
+    /// three cases the parameter form cannot distinguish on its own.
+    fn update_entity_schemas() -> ToolSchemas {
+        ToolSchemas::parse(Some(
+            &serde_json::json!([{
+                "type": "function",
+                "function": {
+                    "name": "update_entity",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "fields": {"type": "object"},
+                            "id": {"type": "string"},
+                            "revision": {"type": "integer"},
+                            "tags": {"type": "array"},
+                        },
+                    },
+                },
+            }])
+            .to_string(),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn parameter_form_types_its_values_from_the_tool_schema() {
+        // Qwen3.6 emits this shape, and every value in it is bare text. Without
+        // the schema `fields` deserializes as a string and the tool rejects it
+        // with "invalid type: string ..., expected a map".
+        let raw = "<tool_call>\n<function=update_entity>\n\
+                   <parameter=id>\nABB1-NTP1\n</parameter>\n\
+                   <parameter=fields>\n{\"Vendor\": \"Meinberg\"}\n</parameter>\n\
+                   <parameter=revision>\n7\n</parameter>\n\
+                   <parameter=tags>\n[\"ntp\"]\n</parameter>\n\
+                   </function>\n</tool_call>";
+        let out = parse_xml_tool_calls(raw, Some(&update_entity_schemas())).unwrap();
+        assert_eq!(out[0].0, "update_entity");
+        assert_eq!(
+            out[0].1["fields"],
+            serde_json::json!({"Vendor": "Meinberg"})
+        );
+        assert_eq!(out[0].1["id"], serde_json::json!("ABB1-NTP1"));
+        assert_eq!(out[0].1["revision"], serde_json::json!(7));
+        assert_eq!(out[0].1["tags"], serde_json::json!(["ntp"]));
+    }
+
+    #[test]
+    fn a_string_parameter_keeps_json_looking_text_verbatim() {
+        // The other half of the same problem: a declared string must survive
+        // even when its content reads as JSON, or a tool that writes a script
+        // or a document gets a parsed object instead of the text.
+        let raw = "<tool_call>\n<function=update_entity>\n\
+                   <parameter=id>\n{\"not\": \"an object\"}\n</parameter>\n\
+                   </function>\n</tool_call>";
+        let out = parse_xml_tool_calls(raw, Some(&update_entity_schemas())).unwrap();
+        assert_eq!(
+            out[0].1["id"],
+            serde_json::json!("{\"not\": \"an object\"}")
+        );
+    }
+
+    #[test]
+    fn without_a_schema_only_objects_and_arrays_are_parsed() {
+        // No schema to lean on, so structure is recovered but a bare `7` stays
+        // text rather than being guessed into a number.
+        let raw = "<tool_call>\n<function=unknown>\n\
+                   <parameter=fields>\n{\"Vendor\": \"Meinberg\"}\n</parameter>\n\
+                   <parameter=revision>\n7\n</parameter>\n\
+                   </function>\n</tool_call>";
+        let out = parse_xml_tool_calls(raw, None).unwrap();
+        assert_eq!(
+            out[0].1["fields"],
+            serde_json::json!({"Vendor": "Meinberg"})
+        );
+        assert_eq!(out[0].1["revision"], serde_json::json!("7"));
+    }
+
+    #[test]
+    fn a_nullable_parameter_uses_its_non_null_type() {
+        let schemas = ToolSchemas::parse(Some(
+            &serde_json::json!([{
+                "type": "function",
+                "function": {
+                    "name": "t",
+                    "parameters": {"properties": {"note": {"type": ["string", "null"]}}},
+                },
+            }])
+            .to_string(),
+        ))
+        .unwrap();
+        let raw = "<tool_call>\n<function=t>\n<parameter=note>\n{\"a\": 1}\n</parameter>\n\
+                   </function>\n</tool_call>";
+        let out = parse_xml_tool_calls(raw, Some(&schemas)).unwrap();
+        assert_eq!(out[0].1["note"], serde_json::json!("{\"a\": 1}"));
+    }
+
     #[test]
     fn parse_xml_tool_calls_multiple_blocks() {
         let raw = "<tool_call>{\"name\": \"a\", \"arguments\": {}}</tool_call>\n<tool_call>{\"name\": \"b\", \"arguments\": {}}</tool_call>";
-        let out = parse_xml_tool_calls(raw).unwrap();
+        let out = parse_xml_tool_calls(raw, None).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].0, "a");
         assert_eq!(out[1].0, "b");
@@ -608,14 +773,14 @@ mod tests {
     #[test]
     fn parse_tool_calls_dispatches_to_the_gemma_dialect() {
         let raw = "<|tool_call>call:get_time{}<tool_call|>";
-        let out = parse_tool_calls(raw).unwrap();
+        let out = parse_tool_calls(raw, None).unwrap();
         assert_eq!(out[0].0, "get_time");
     }
 
     #[test]
     fn parse_completion_output_surfaces_gemma_tool_call() {
         let raw = "<|channel>thought\nreasoning<channel|><|tool_call>call:get_time{}<tool_call|>";
-        let content = parse_completion_output(raw, false).unwrap();
+        let content = parse_completion_output(raw, false, None).unwrap();
         let call = content.iter().find_map(|c| match c {
             AssistantContent::ToolCall(tc) => Some(tc.clone()),
             _ => None,
@@ -667,7 +832,7 @@ mod tests {
     #[test]
     fn parse_completion_output_surfaces_gemma_reasoning() {
         let raw = "<|channel>thought\nreason about it\n<channel|>Because of Rayleigh scattering.";
-        let content = parse_completion_output(raw, false).unwrap();
+        let content = parse_completion_output(raw, false, None).unwrap();
         let has_reasoning = content
             .iter()
             .any(|c| matches!(c, AssistantContent::Reasoning(_)));

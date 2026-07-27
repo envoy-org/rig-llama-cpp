@@ -4,7 +4,9 @@ use rig_core::message::{AssistantContent, ToolCall, ToolFunction};
 use rig_core::one_or_many::OneOrMany;
 use rig_core::streaming::{RawStreamingChoice, RawStreamingToolCall};
 
-use crate::parsing::{extract_structured_json, parse_completion_output, parse_tool_calls};
+use crate::parsing::{
+    ToolSchemas, extract_structured_json, parse_completion_output, parse_tool_calls,
+};
 use crate::slot::SlotEntry;
 use crate::types::{InferenceParams, InferenceResult, PromptBuildResult, StreamSender};
 use crate::worker::CANCEL_ERR;
@@ -325,11 +327,21 @@ fn sample_loop(
 
     log::debug!("raw output:\n{output}");
 
+    // The parameter form carries no types, so the tool schemas have to be on
+    // hand to read its values back — see `parsing::ToolSchemas`.
+    let schemas = ToolSchemas::parse(req.prepared_request.tools_json.as_deref());
+
     if let Some(tx) = stream_tx {
-        flush_stream(tx, &output, has_tools, has_schema_request);
+        flush_stream(tx, &output, has_tools, has_schema_request, schemas.as_ref());
     }
 
-    let choice = build_choice(&output, stream_tx.is_some(), has_tools, has_schema_request)?;
+    let choice = build_choice(
+        &output,
+        stream_tx.is_some(),
+        has_tools,
+        has_schema_request,
+        schemas.as_ref(),
+    )?;
 
     Ok((output, choice, completion_tokens))
 }
@@ -345,7 +357,13 @@ fn sample_loop(
 ///   `ToolCall` events. Any leading prose before the first `<tool_call>` is
 ///   also surfaced as a message chunk.
 /// - **plain text**: nothing to flush (text was streamed incrementally).
-fn flush_stream(tx: &StreamSender, output: &str, has_tools: bool, has_schema: bool) {
+fn flush_stream(
+    tx: &StreamSender,
+    output: &str,
+    has_tools: bool,
+    has_schema: bool,
+    schemas: Option<&ToolSchemas>,
+) {
     if has_schema {
         let text = extract_structured_json(output).unwrap_or_else(|| output.to_string());
         if !text.is_empty() {
@@ -355,7 +373,7 @@ fn flush_stream(tx: &StreamSender, output: &str, has_tools: bool, has_schema: bo
     }
 
     if has_tools {
-        if let Some(tool_calls) = parse_tool_calls(output) {
+        if let Some(tool_calls) = parse_tool_calls(output, schemas) {
             // Surface any prose preceding the first tool call as text. Models
             // disagree on the marker, so take the earliest one that appears.
             if let Some(prefix_end) = crate::parsing::TOOL_CALL_MARKERS
@@ -389,12 +407,13 @@ fn build_choice(
     is_stream: bool,
     has_tools: bool,
     has_schema: bool,
+    schemas: Option<&ToolSchemas>,
 ) -> Result<OneOrMany<AssistantContent>, String> {
     if is_stream {
         if has_schema && let Some(json) = extract_structured_json(output) {
             return Ok(OneOrMany::one(AssistantContent::text(json)));
         }
-        if has_tools && let Some(tool_calls) = parse_tool_calls(output) {
+        if has_tools && let Some(tool_calls) = parse_tool_calls(output, schemas) {
             let mut content: Vec<AssistantContent> = Vec::new();
             for (i, (name, arguments)) in tool_calls.into_iter().enumerate() {
                 content.push(AssistantContent::ToolCall(ToolCall::new(
@@ -409,7 +428,7 @@ fn build_choice(
         return Ok(OneOrMany::one(AssistantContent::text(output.to_string())));
     }
 
-    parse_completion_output(output, has_schema)
+    parse_completion_output(output, has_schema, schemas)
 }
 
 #[cfg(test)]

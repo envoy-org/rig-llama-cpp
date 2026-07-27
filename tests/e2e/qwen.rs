@@ -111,6 +111,179 @@ async fn qwen_tool_roundtrip() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The regression `0.4.0` introduced and `0.5.1` fixed.
+///
+/// One call plus a prose follow-up does not catch it: the prompt had lost the
+/// assistant's own `tool_calls`, and a model handed a tool result it never
+/// asked for will still say *something*. What it stops doing is calling a
+/// second tool — small models give up there, which is exactly how this
+/// surfaced. So drive two sequential calls and assert the second happens.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(model)]
+#[ignore = "downloads Qwen 3.5-2B and validates a two-step tool sequence"]
+async fn qwen_calls_a_second_tool_after_a_result() -> anyhow::Result<()> {
+    use anyhow::Context;
+    use rig_core::completion::ToolDefinition;
+    use rig_core::message::{AssistantContent, Message, ToolResultContent, UserContent};
+    use rig_core::one_or_many::OneOrMany;
+    use serde_json::json;
+
+    let path = ensure_model(&QWEN)?;
+    let (_client, model) = load_default(&path)?;
+
+    let get_time = ToolDefinition {
+        name: "get_time".to_string(),
+        description: "Return the current UTC time as plain text.".to_string(),
+        parameters: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+    };
+    let save_time = ToolDefinition {
+        name: "save_time".to_string(),
+        description: "Persist a time string. Call this after get_time.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": false,
+        }),
+    };
+
+    let preamble = "You have access to tools. Use them when needed, one at a time.";
+    let task = "Find the current time with get_time, then store it with save_time.";
+
+    let first = model
+        .completion_request(task)
+        .preamble(preamble.to_string())
+        .tool(get_time.clone())
+        .tool(save_time.clone())
+        .max_tokens(256)
+        .temperature(0.0)
+        .send()
+        .await?;
+
+    let call = first
+        .choice
+        .iter()
+        .find_map(|c| match c {
+            AssistantContent::ToolCall(tc) => Some(tc.clone()),
+            _ => None,
+        })
+        .context("model did not produce a first tool call")?;
+    ensure!(
+        call.function.name == "get_time",
+        "expected get_time first, got {}",
+        call.function.name
+    );
+
+    let result = Message::from(UserContent::tool_result_with_call_id(
+        "tool-result-utc",
+        call.call_id.clone().unwrap_or_else(|| call.id.clone()),
+        OneOrMany::one(ToolResultContent::text(
+            "Current time: 2026-04-12 15:30:00 UTC",
+        )),
+    ));
+
+    let second = model
+        .completion_request("Continue.")
+        .preamble(preamble.to_string())
+        .tool(get_time)
+        .tool(save_time)
+        .messages(vec![Message::user(task), Message::from(call), result])
+        .max_tokens(256)
+        .temperature(0.0)
+        .send()
+        .await?;
+
+    let follow_up = second
+        .choice
+        .iter()
+        .find_map(|c| match c {
+            AssistantContent::ToolCall(tc) => Some(tc.clone()),
+            _ => None,
+        })
+        .context(
+            "model made no second tool call — the assistant's first call is probably \
+             missing from the rendered prompt",
+        )?;
+    println!(
+        "qwen_calls_a_second_tool_after_a_result: second call={} args={}",
+        follow_up.function.name, follow_up.function.arguments
+    );
+    ensure!(
+        follow_up.function.name == "save_time",
+        "expected save_time second, got {}",
+        follow_up.function.name
+    );
+    Ok(())
+}
+
+/// Qwen's `<parameter=…>` form carries no types — every value is bare text —
+/// so an object-valued argument has to be parsed back into an object using the
+/// tool's declared schema. Without that the tool rejects the call with
+/// "invalid type: string ..., expected a map" and the agent gives up.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(model)]
+#[ignore = "downloads Qwen 3.5-2B and validates an object-valued tool argument"]
+async fn qwen_passes_an_object_valued_argument() -> anyhow::Result<()> {
+    use anyhow::Context;
+    use rig_core::completion::ToolDefinition;
+    use rig_core::message::AssistantContent;
+    use serde_json::{Value, json};
+
+    let path = ensure_model(&QWEN)?;
+    let (_client, model) = load_default(&path)?;
+
+    let update_entity = ToolDefinition {
+        name: "update_entity".to_string(),
+        description: "Update fields on an entity.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "The entity ID."},
+                "fields": {
+                    "type": "object",
+                    "description": "Field name to new value, e.g. {\"Vendor\": \"Acme\"}.",
+                },
+            },
+            "required": ["id", "fields"],
+            "additionalProperties": false,
+        }),
+    };
+
+    let response = model
+        .completion_request("Set the Vendor field of asset ABB1-NTP1 to Meinberg.")
+        .preamble("You have access to tools. Use them when needed.".to_string())
+        .tool(update_entity)
+        .max_tokens(256)
+        .temperature(0.0)
+        .send()
+        .await?;
+
+    let call = response
+        .choice
+        .iter()
+        .find_map(|c| match c {
+            AssistantContent::ToolCall(tc) => Some(tc.clone()),
+            _ => None,
+        })
+        .context("model did not produce a tool call")?;
+    println!(
+        "qwen_passes_an_object_valued_argument: args={}",
+        call.function.arguments
+    );
+
+    let fields = call
+        .function
+        .arguments
+        .get("fields")
+        .context("call carried no `fields` argument")?;
+    ensure!(
+        matches!(fields, Value::Object(_)),
+        "`fields` reached the tool as {fields:?}, not an object — the tool's \
+         deserializer would reject this with \"expected a map\""
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial(model)]
 #[ignore = "downloads Qwen 3.5-2B and validates structured-output extraction"]

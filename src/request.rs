@@ -169,8 +169,7 @@ pub(crate) fn prepare_request(request: &CompletionRequest) -> Result<PreparedReq
         enable_thinking: request
             .additional_params
             .as_ref()
-            .map(has_thinking_request)
-            .unwrap_or(false),
+            .and_then(thinking_preference),
         #[cfg(feature = "mtmd")]
         images,
     })
@@ -475,13 +474,15 @@ fn extract_image_bytes(image: &rig_core::message::Image) -> Result<Vec<u8>, Stri
     }
 }
 
-fn has_thinking_request(params: &Value) -> bool {
-    // check actual value of reasoning/thinking param if present
-    if let Some(reasoning) = params.get("reasoning").or_else(|| params.get("thinking"))
-        && let Some(enabled) = reasoning.as_bool()
-    {
-        return enabled;
-    }
-
-    false
+/// The caller's reasoning preference, or `None` if they expressed none.
+///
+/// The distinction matters: a template that gates reasoning on
+/// `enable_thinking is defined` reads an unconditional `false` as "thinking
+/// off", which is not what an absent parameter means. See
+/// [`crate::types::PreparedRequest::enable_thinking`].
+fn thinking_preference(params: &Value) -> Option<bool> {
+    params
+        .get("reasoning")
+        .or_else(|| params.get("thinking"))
+        .and_then(Value::as_bool)
 }

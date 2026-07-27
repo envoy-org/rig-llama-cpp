@@ -112,13 +112,20 @@ pub(crate) struct PreparedRequest {
     pub json_schema: Option<String>,
     /// Parsed from the request's `additional_params` (`{ "thinking": bool }`).
     ///
-    /// Forwarded to the template as the `enable_thinking` variable, but only on
-    /// the minijinja path (`src/jinja.rs`). llama.cpp's own applier takes just
+    /// `None` means the caller expressed no preference, and is distinct from
+    /// `Some(false)`: templates commonly gate reasoning on
+    /// `enable_thinking is defined` or `| default(true)`, so passing an
+    /// explicit `false` for an unasked question turns thinking *off* for a
+    /// model that reasons by default. `None` reaches the template as undefined,
+    /// leaving its own default in charge.
+    ///
+    /// Forwarded as the `enable_thinking` variable, but only on the minijinja
+    /// paths (`src/jinja.rs`). llama.cpp's own applier takes just
     /// `(role, content)` pairs — `llama-cpp-2` 0.1.147 dropped the
     /// `chat_template_kwargs` plumbing the old oaicompat path used — so for a
     /// model llama.cpp can template natively this flag stays advisory and the
     /// template's own default decides.
-    pub enable_thinking: bool,
+    pub enable_thinking: Option<bool>,
     #[cfg(feature = "mtmd")]
     pub images: Vec<PreparedImage>,
 }

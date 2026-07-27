@@ -20,6 +20,73 @@ from `llama-cpp-2`. A new upstream `ggml_type` is therefore an additive
 `0.1.x` change here (we add a corresponding shim variant), not a breaking
 release.
 
+## [0.5.1] — 2026-07-27
+
+### Fixed
+
+- **A tool-calling turn no longer loses the call that made it.** `tool_calls`
+  is a sibling of `content`, not part of it, so flattening a message to the
+  `(role, content)` pair `apply_chat_template` accepts erased the assistant's
+  own tool calls. The model was shown an empty assistant turn followed by a
+  tool result it had no record of requesting, and answered accordingly: small
+  models stopped after the first call, large ones guessed and sometimes emitted
+  a malformed `<tool_call>` with no `name`. `build_prompt` now takes a fourth
+  path ahead of the other three, used whenever the request offers tools or the
+  history already contains tool traffic: the model's own template is rendered
+  with the structured messages and a native `tools` array, exactly as the
+  `apply_chat_template_oaicompat` path removed in `llama-cpp-2` `0.1.147` used
+  to do. Regressed in `0.4.0`, which is where that path went away.
+
+  `tool_calls[].function.arguments` is parsed back into an object for the
+  template. `src/request.rs` serializes it as a JSON-encoded string, matching
+  the OpenAI wire format, but templates render it with `| tojson` — handed a
+  string that emits a quoted, escaped blob and teaches the model to call tools
+  wrongly.
+
+- **Parameter-form arguments are typed from the tool schema.** Qwen's
+  `<function=…><parameter=…>` form carries no types — every value is bare text
+  between tags — and `parse_parameter_form` stored each one as a JSON string. An
+  object-valued argument therefore reached the tool as
+  `"{\"Vendor\": \"Meinberg\"}"` and was rejected with *invalid type: string
+  …, expected a map*, which reads as an agent that cannot edit anything. The
+  request's `tools_json` now travels with the parse (`parsing::ToolSchemas`), so
+  a declared `object`/`array`/`number`/`boolean` parameter is parsed back into
+  that shape while a declared `string` keeps its text verbatim — the latter
+  matters for tools whose arguments are scripts or documents that happen to read
+  as JSON. With no schema to consult, only objects and arrays are recovered, so
+  free text reading as `7` or `true` is left alone.
+
+  Latent before `0.5.1`: the parameter form was only reachable once the model
+  was prompted with its own template.
+
+- **Paths 1-3 no longer drop tool traffic silently.** They cannot represent it
+  structurally, so they now fold it into the message text using the same
+  portable protocol the injected directive asks for: `<tool_call>` blocks on
+  the assistant turn, and a `<tool_response>`-wrapped user turn for a result.
+  Lossy against a model with its own dialect, but no longer invisible.
+
+- **`enable_thinking` distinguishes "off" from "unspecified".** It was a plain
+  `bool` defaulting to `false`, and templates commonly gate reasoning on
+  `enable_thinking is defined` — so an absent parameter read as an explicit
+  "off". It is now `Option<bool>` and reaches the template as *undefined* when
+  the caller expressed no preference, leaving the template's own default in
+  charge. Qwen3.6 prefills an empty `<think></think>` for an explicit `false`.
+
+- **`minijinja`'s `json` feature is enabled**, and the pycompat shim learned
+  `startswith`, `endswith`, `strip`, `lstrip` and `rstrip`. Real templates need
+  all of them: without `tojson` every tool-calling template fails to render,
+  and Qwen3.6 calls `startswith`. A missing method failed the whole render and
+  dropped the turn to a lossy path.
+
+### Added
+
+- `tests/fixtures/qwen3.6-chat-template.jinja` and
+  `gemma4-chat-template.jinja`, lifted verbatim from the GGUFs, with unit
+  tests that render a completed tool call through each. One asserts the round
+  trip closes: what Qwen3.6's template emits for a past call is what
+  `parse_xml_tool_calls` reads back out of the next completion — its
+  `<function=…><parameter=…>` form, not the JSON one.
+
 ## [0.5.0] — 2026-07-26
 
 ### Changed
